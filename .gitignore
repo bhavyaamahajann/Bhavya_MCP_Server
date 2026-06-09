@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+
+# Google API client secrets and tokens (CRITICAL: Do not commit secrets)
+credentials.json
+credentails.json
+google_credentials.json
+token.json
+client_secret*.json
+
+# OS files
+.DS_Store
