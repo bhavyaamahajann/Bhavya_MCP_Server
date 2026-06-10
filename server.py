@@ -33,15 +33,20 @@ def get_google_services():
     global docs_service, gmail_service
     
     # Write token from environment variable if present (e.g. for cloud deployments like Railway)
-    token_env = os.getenv("GOOGLE_TOKEN_JSON_CONTENT")
+    token_env = os.getenv("GOOGLE_TOKEN_JSON") or os.getenv("GOOGLE_TOKEN_JSON_CONTENT")
     if token_env:
         try:
             os.makedirs("mcp_server", exist_ok=True)
             with open("mcp_server/token.json", "w") as f:
                 f.write(token_env)
-            print("Loaded Google token.json from environment variable GOOGLE_TOKEN_JSON_CONTENT.")
+            print("Loaded Google token.json from environment variable.")
         except Exception as e:
             print(f"Failed to write token from environment variable: {e}")
+
+    # Log/observe terminal approval setting
+    req_term_approval = os.getenv("REQUIRE_TERMINAL_APPROVAL")
+    if req_term_approval is not None:
+        print(f"REQUIRE_TERMINAL_APPROVAL is set to: {req_term_approval}")
 
     # 0. Check for forced simulation mode
     if os.getenv("USE_MOCK_GOOGLE") == "true":
@@ -53,6 +58,29 @@ def get_google_services():
         return None, None
 
     creds = None
+    # 0.5. Check GOOGLE_CREDENTIALS_JSON (could be service account JSON or OAuth client secrets JSON)
+    sa_info_str = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if sa_info_str:
+        try:
+            info = json.loads(sa_info_str)
+            if info.get("type") == "service_account":
+                creds = service_account.Credentials.from_service_account_info(
+                    info,
+                    scopes=[
+                        'https://www.googleapis.com/auth/documents',
+                        'https://www.googleapis.com/auth/gmail.modify'
+                    ]
+                )
+                print("Authenticated using service account credentials from GOOGLE_CREDENTIALS_JSON env var.")
+            else:
+                # Write to client secrets path dynamically
+                os.makedirs("mcp_server", exist_ok=True)
+                with open("mcp_server/credentials.json", "w") as f:
+                    f.write(sa_info_str)
+                print("Written client secrets from GOOGLE_CREDENTIALS_JSON env var to mcp_server/credentials.json")
+        except Exception as e:
+            print(f"Failed to process GOOGLE_CREDENTIALS_JSON env var: {e}")
+
     # 1. Check env var for Service Account path
     sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
     if sa_path and os.path.exists(sa_path):
@@ -482,6 +510,42 @@ def create_gmail_draft(recipient: str, subject: str, body: str, iso_week: str = 
         print(f"Error executing real gmail draft creation: {e}")
         return f"failed_real_gmail_draft_{iso_week}"
 
+class APIKeyASGIMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            api_secret = os.getenv("API_SECRET_KEY")
+            if api_secret:
+                path = scope.get("path", "")
+                # Skip auth for root healthcheck endpoint
+                if path != "/":
+                    # Check X-API-Key header
+                    headers = scope.get("headers", [])
+                    api_key = None
+                    for k, v in headers:
+                        if k.lower() == b"x-api-key":
+                            api_key = v.decode("utf-8")
+                            break
+                    
+                    if not api_key or api_key != api_secret:
+                        # Return 401 Unauthorized
+                        await send({
+                            "type": "http.response.start",
+                            "status": 401,
+                            "headers": [
+                                (b"content-type", b"application/json"),
+                            ],
+                        })
+                        await send({
+                            "type": "http.response.body",
+                            "body": b'{"detail": "Unauthorized"}',
+                            "more_body": False,
+                        })
+                        return
+        await self.app(scope, receive, send)
+
 if __name__ == "__main__":
     default_port = int(os.getenv("PORT", 3001))
     default_host = os.getenv("HOST", "127.0.0.1" if os.getenv("PORT") is None else "0.0.0.0")
@@ -508,6 +572,13 @@ if __name__ == "__main__":
         })
         
     mcp._custom_starlette_routes.append(Route("/", endpoint=root_endpoint))
+    
+    # Wrap sse_app with APIKeyASGIMiddleware
+    original_sse_app = mcp.sse_app
+    def secure_sse_app(mount_path=None):
+        app = original_sse_app(mount_path)
+        return APIKeyASGIMiddleware(app)
+    mcp.sse_app = secure_sse_app
     
     print(f"Starting MCP server on {args.host}:{args.port} using {args.transport} transport...")
     mcp.run(transport=args.transport)
